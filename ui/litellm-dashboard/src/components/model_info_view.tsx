@@ -18,7 +18,9 @@ import {
   Button as TremorButton,
 } from "@tremor/react";
 import { Button, DatePicker, Form, Input, Modal, Select, Tooltip } from "antd";
-import { formatPtuUtcDisplay, ptuPickerToUtcIso, utcIsoToPickerValue } from "../utils/ptuDatetime";
+import { formatPtuUtcDisplay, utcIsoToPickerValue } from "../utils/ptuDatetime";
+import { applyPtuModelInfo } from "../utils/ptuModelInfo";
+import { usePtuCostAttributionEnabled } from "@/app/(dashboard)/hooks/uiSettings/usePtuCostAttributionEnabled";
 import { PTU_COUNT_FIELD, PTU_RATE_FIELD, ptuCountRules, ptuPairRule, ptuRateRules } from "../utils/ptuValidation";
 import VectorStoreSelector from "./vector_store_management/VectorStoreSelector";
 import { CheckIcon, CopyIcon } from "lucide-react";
@@ -68,6 +70,37 @@ interface ModelInfoViewProps {
   onModelUpdate?: (updatedModel: any) => void;
   modelAccessGroups: string[] | null;
 }
+
+interface PtuEditField {
+  name: string;
+  label: string;
+  input: "number" | "datetime";
+  placeholder?: string;
+  isCount?: boolean;
+  isRate?: boolean;
+  pairedWith?: string;
+}
+
+const PTU_EDIT_FIELDS: PtuEditField[] = [
+  {
+    name: PTU_COUNT_FIELD,
+    label: "PTU Count",
+    input: "number",
+    placeholder: "e.g. 15",
+    isCount: true,
+    pairedWith: PTU_RATE_FIELD,
+  },
+  {
+    name: PTU_RATE_FIELD,
+    label: "Cost per PTU / Hour (USD)",
+    input: "number",
+    placeholder: "e.g. 2.00",
+    isRate: true,
+    pairedWith: PTU_COUNT_FIELD,
+  },
+  { name: "ptu_effective_from", label: "PTU Effective From (UTC)", input: "datetime" },
+  { name: "ptu_effective_to", label: "PTU Effective To (UTC)", input: "datetime" },
+];
 
 interface ComplexityRouterTierConfig {
   tiers?: {
@@ -158,6 +191,7 @@ export default function ModelInfoView({
   const { data: modelCostMapData } = useModelCostMap();
   const { data: modelHubData } = useModelHub();
   const { data: teams } = useTeams();
+  const ptuCostAttributionEnabled = usePtuCostAttributionEnabled();
 
   // Transform the model data
   const getProviderFromModel = (model: string) => {
@@ -429,15 +463,7 @@ export default function ModelInfoView({
             health_check_model: values.health_check_model,
           };
         }
-        const ptuNumber = (val: string | number | null | undefined): number | null =>
-          val !== undefined && val !== null && val !== "" ? Number(val) : null;
-        updatedModelInfo = {
-          ...updatedModelInfo,
-          ptu_count: ptuNumber(values.ptu_count),
-          cost_per_ptu_per_hour: ptuNumber(values.cost_per_ptu_per_hour),
-          ptu_effective_from: ptuPickerToUtcIso(values.ptu_effective_from),
-          ptu_effective_to: ptuPickerToUtcIso(values.ptu_effective_to),
-        };
+        updatedModelInfo = applyPtuModelInfo(updatedModelInfo, values, ptuCostAttributionEnabled);
       } catch (e) {
         NotificationsManager.fromBackend("Invalid JSON in Model Info");
         return;
@@ -887,58 +913,40 @@ export default function ModelInfoView({
                         )}
                       </div>
 
-                      {[
-                        {
-                          name: PTU_COUNT_FIELD,
-                          label: "PTU Count",
-                          input: "number" as const,
-                          placeholder: "e.g. 15",
-                          isCount: true,
-                          pairedWith: PTU_RATE_FIELD,
-                        },
-                        {
-                          name: PTU_RATE_FIELD,
-                          label: "Cost per PTU / Hour (USD)",
-                          input: "number" as const,
-                          placeholder: "e.g. 2.00",
-                          isRate: true,
-                          pairedWith: PTU_COUNT_FIELD,
-                        },
-                        { name: "ptu_effective_from", label: "PTU Effective From (UTC)", input: "datetime" as const },
-                        { name: "ptu_effective_to", label: "PTU Effective To (UTC)", input: "datetime" as const },
-                      ].map(({ name, label, input, placeholder, isCount, isRate, pairedWith }) => (
-                        <div key={name}>
-                          <Text className="font-medium">{label}</Text>
-                          {isEditing ? (
-                            <Form.Item
-                              name={name}
-                              className="mb-0"
-                              dependencies={pairedWith ? [pairedWith] : undefined}
-                              rules={[
-                                ...(isCount ? ptuCountRules : []),
-                                ...(isRate ? ptuRateRules : []),
-                                ...(pairedWith ? [ptuPairRule(pairedWith)] : []),
-                              ]}
-                            >
-                              {input === "number" ? (
-                                <NumericalInput
-                                  placeholder={placeholder}
-                                  step={isCount ? 1 : undefined}
-                                  min={isCount ? 1 : 0}
-                                />
-                              ) : (
-                                <DatePicker showTime style={{ width: "100%" }} />
-                              )}
-                            </Form.Item>
-                          ) : (
-                            <div className="mt-1 p-2 bg-gray-50 rounded-sm">
-                              {(input === "datetime"
-                                ? formatPtuUtcDisplay(localModelData?.model_info?.[name])
-                                : localModelData?.model_info?.[name]) ?? "Not Set"}
-                            </div>
-                          )}
-                        </div>
-                      ))}
+                      {ptuCostAttributionEnabled &&
+                        PTU_EDIT_FIELDS.map(({ name, label, input, placeholder, isCount, isRate, pairedWith }) => (
+                          <div key={name}>
+                            <Text className="font-medium">{label}</Text>
+                            {isEditing ? (
+                              <Form.Item
+                                name={name}
+                                className="mb-0"
+                                dependencies={pairedWith ? [pairedWith] : undefined}
+                                rules={[
+                                  ...(isCount ? ptuCountRules : []),
+                                  ...(isRate ? ptuRateRules : []),
+                                  ...(pairedWith ? [ptuPairRule(pairedWith)] : []),
+                                ]}
+                              >
+                                {input === "number" ? (
+                                  <NumericalInput
+                                    placeholder={placeholder}
+                                    step={isCount ? 1 : undefined}
+                                    min={isCount ? 1 : 0}
+                                  />
+                                ) : (
+                                  <DatePicker showTime style={{ width: "100%" }} />
+                                )}
+                              </Form.Item>
+                            ) : (
+                              <div className="mt-1 p-2 bg-gray-50 rounded-sm">
+                                {(input === "datetime"
+                                  ? formatPtuUtcDisplay(localModelData?.model_info?.[name])
+                                  : localModelData?.model_info?.[name]) ?? "Not Set"}
+                              </div>
+                            )}
+                          </div>
+                        ))}
 
                       <div>
                         <Text className="font-medium">Cache Read Cost (per 1M tokens)</Text>
