@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import shutil
 import subprocess
 import sys
@@ -15,7 +16,7 @@ _spec.loader.exec_module(gate)
 
 Violation = gate.Violation
 
-_ENABLED_BY_THE_NORMAL_CONFIG = frozenset({"F401", "RUF100"})
+_ENABLED_BY_RUFF_DEFAULTS = frozenset({"F401"})
 
 
 def rule(name, limit):
@@ -167,6 +168,14 @@ def _external_codes() -> frozenset:
     return frozenset(_lint_section("ruff.toml")["external"])
 
 
+def _selected_by_the_normal_config() -> frozenset:
+    return frozenset(_lint_section("ruff.toml")["extend-select"]) | _ENABLED_BY_RUFF_DEFAULTS
+
+
+def _budgeted_rules() -> frozenset:
+    return frozenset(json.loads((_REPO_ROOT / "ruff-strict-budget.json").read_text()))
+
+
 def _ruff_binary() -> str | None:
     beside_interpreter = Path(sys.executable).with_name("ruff")
     return str(beside_interpreter) if beside_interpreter.exists() else shutil.which("ruff")
@@ -197,7 +206,7 @@ def _ruff_output_for_noqa(code: str, *extra_args: str) -> str:
 
 def test_every_strict_gate_rule_is_external_to_the_normal_ruff_config():
     strict_rules = frozenset(_lint_section("ruff-strict.toml")["select"])
-    unprotected = strict_rules - _external_codes() - _ENABLED_BY_THE_NORMAL_CONFIG
+    unprotected = strict_rules - _external_codes() - _selected_by_the_normal_config()
     assert unprotected == frozenset(), (
         f"`ruff check` deletes any `# noqa` naming {sorted(unprotected)} as unused, so suppressing "
         "one of those strict-gate rules breaks lint. Add them to ruff.toml's lint.external."
@@ -205,7 +214,20 @@ def test_every_strict_gate_rule_is_external_to_the_normal_ruff_config():
 
 
 def test_the_codes_this_config_enforces_itself_stay_out_of_external():
-    assert _ENABLED_BY_THE_NORMAL_CONFIG.isdisjoint(_external_codes())
+    both = _selected_by_the_normal_config() & _external_codes()
+    assert both == frozenset(), (
+        f"{sorted(both)} are enabled by ruff.toml itself, so listing them as external stops RUF100 "
+        "from ever reporting their stale suppressions. Drop them from lint.external."
+    )
+
+
+def test_every_budgeted_rule_is_one_the_gate_actually_measures():
+    selectors = tuple(_lint_section("ruff-strict.toml")["select"])
+    unmeasured = frozenset(code for code in _budgeted_rules() if not code.startswith(selectors))
+    assert unmeasured == frozenset(), (
+        f"the gate never counts {sorted(unmeasured)}, so their ceilings are dead config that reads "
+        "as coverage. Either select them in ruff-strict.toml or drop them from the budget."
+    )
 
 
 @_needs_ruff
@@ -221,3 +243,30 @@ def test_the_external_list_is_what_saves_that_noqa():
 @_needs_ruff
 def test_a_stale_noqa_for_a_locally_enabled_rule_is_still_reported():
     assert "RUF100" in _ruff_output_for_noqa("F401")
+
+
+def _ruff_output_for_source(source: str) -> str:
+    proc = subprocess.run(
+        [_RUFF, "check", "--no-cache", "--stdin-filename", "litellm/types/_graduate_probe.py", "-"],
+        cwd=_REPO_ROOT,
+        input=source,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout
+
+
+_DEPRECATED_TYPING_ALIAS = "from typing import List  # noqa: UP035\n\n\ndef _probe(x: List[int]) -> None: ...\n"
+
+
+@_needs_ruff
+def test_a_graduated_rule_now_fails_the_normal_ruff_run_instead_of_waiting_for_the_gate():
+    assert "UP006" in _ruff_output_for_source(_DEPRECATED_TYPING_ALIAS)
+
+
+@_needs_ruff
+def test_a_graduated_rule_can_still_be_suppressed_without_tripping_unused_noqa():
+    suppressed = _DEPRECATED_TYPING_ALIAS.replace("...\n", "...  # noqa: UP006\n")
+    output = _ruff_output_for_source(suppressed)
+    assert "UP006" not in output
+    assert "RUF100" not in output
