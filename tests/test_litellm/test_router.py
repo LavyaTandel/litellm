@@ -7415,3 +7415,32 @@ class TestAutoRouterMaxInputCharsWiring:
         router = self._router()
 
         assert self._registered_auto_router(router).max_input_chars == DEFAULT_AUTO_ROUTER_MAX_INPUT_CHARS
+
+
+def test_stamp_or_clear_metadata_key_writes_and_clears_both_buckets():
+    request_kwargs = {"metadata": {}}
+    litellm.Router._stamp_or_clear_metadata_key(request_kwargs=request_kwargs, key="probe", value=7)
+    assert request_kwargs["metadata"]["probe"] == 7
+
+    stale_kwargs = {"metadata": {"probe": 7}, "litellm_metadata": {"probe": 7}}
+    litellm.Router._stamp_or_clear_metadata_key(request_kwargs=stale_kwargs, key="probe", value=None)
+    assert "probe" not in stale_kwargs["metadata"]
+    assert "probe" not in stale_kwargs["litellm_metadata"]
+
+
+def test_ensure_deployment_affinity_callback_is_idempotent():
+    from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
+        DeploymentAffinityCheck,
+    )
+
+    router = litellm.Router(model_list=[])
+    try:
+        router._ensure_deployment_affinity_callback()
+        router._ensure_deployment_affinity_callback()
+        affinity_callbacks = [
+            cb for cb in router.optional_callbacks or [] if isinstance(cb, DeploymentAffinityCheck)
+        ]
+        assert len(affinity_callbacks) == 1
+    finally:
+        for cb in router.optional_callbacks or []:
+            litellm.logging_callback_manager.remove_callback_from_all_lists(cb)

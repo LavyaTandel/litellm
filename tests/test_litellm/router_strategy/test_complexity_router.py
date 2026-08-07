@@ -3415,6 +3415,53 @@ class TestSessionAffinity:
         return {"metadata": {"session_id": session_id}}
 
     @pytest.mark.asyncio
+    async def test_hook_response_carries_session_affinity_ttl_on_classify_and_pin_paths(
+        self, mock_router_instance, session_affinity_config
+    ):
+        """The hook response's session_affinity_ttl_seconds is what the Router stamps as
+        the deployment-affinity marker, so both the classify path (turn 1) and the
+        session-pin path (turn 2) must carry the configured TTL."""
+        mock_router_instance.cache = DualCache()
+        router = ComplexityRouter(
+            model_name="test-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={**session_affinity_config, "session_affinity_ttl_seconds": 321},
+        )
+        request_kwargs = self._request_kwargs("marker-session")
+        first = await router.async_pre_routing_hook(
+            model="test-model", request_kwargs=request_kwargs, messages=self.SIMPLE_MESSAGE
+        )
+        second = await router.async_pre_routing_hook(
+            model="test-model", request_kwargs=request_kwargs, messages=self.SIMPLE_MESSAGE
+        )
+        assert first.session_affinity_ttl_seconds == 321
+        assert second.session_affinity_ttl_seconds == 321
+
+    @pytest.mark.asyncio
+    async def test_hook_response_has_no_session_affinity_ttl_when_disabled_or_plugins(
+        self, mock_router_instance, basic_config, session_affinity_config
+    ):
+        mock_router_instance.cache = DualCache()
+        disabled_router = ComplexityRouter(
+            model_name="test-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config=basic_config,
+        )
+        plugin_router = ComplexityRouter(
+            model_name="test-router-plugins",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={**session_affinity_config, "plugins": [_DummyPlugin()]},
+        )
+        disabled = await disabled_router.async_pre_routing_hook(
+            model="test-model", request_kwargs=self._request_kwargs("s-off"), messages=self.SIMPLE_MESSAGE
+        )
+        with_plugins = await plugin_router.async_pre_routing_hook(
+            model="test-model", request_kwargs=self._request_kwargs("s-plugins"), messages=self.SIMPLE_MESSAGE
+        )
+        assert disabled.session_affinity_ttl_seconds is None
+        assert with_plugins.session_affinity_ttl_seconds is None
+
+    @pytest.mark.asyncio
     async def test_disabled_by_default_reclassifies_every_turn(self, mock_router_instance, basic_config):
         """Regression: session_affinity defaults to False, so a shared session_id must NOT
         pin the first turn's model; every turn is classified on its own merits."""

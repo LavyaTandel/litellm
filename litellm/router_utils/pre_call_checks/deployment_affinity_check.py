@@ -13,12 +13,14 @@ where routing to a consistent deployment is still beneficial.
 """
 
 import hashlib
+import json
 from typing import Any, Final, cast
 
 from typing_extensions import TypedDict
 
 from litellm._logging import verbose_router_logger
 from litellm.caching.dual_cache import DualCache
+from litellm.constants import SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import AllMessageValues
@@ -27,6 +29,19 @@ from litellm.types.utils import CallTypes
 
 class DeploymentAffinityCacheValue(TypedDict):
     model_id: str
+
+
+_CLAIM_PIN_SCRIPT: Final = """
+local current = redis.call('GET', KEYS[1])
+if current == false then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return ARGV[1]
+end
+if current == ARGV[1] then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return current
+"""
 
 
 class DeploymentAffinityCheck(CustomLogger):
@@ -218,8 +233,13 @@ class DeploymentAffinityCheck(CustomLogger):
         return f"{cls.CACHE_KEY_PREFIX}:{model_group}:{hashed_user_key}"
 
     @classmethod
-    def get_session_affinity_cache_key(cls, model_group: str, session_id: str) -> str:
-        return f"{cls.CACHE_KEY_PREFIX}:session:{model_group}:{session_id}"
+    def get_session_affinity_cache_key(cls, model_group: str, session_id: str, user_key: str | None) -> str:
+        """Session pins are scoped by the caller's hashed API key so two callers reusing
+        the same client-supplied session_id cannot read or steer each other's pin.
+        `"unscoped"` covers direct Router usage with no authenticated caller, matching
+        the complexity router's own session pin key."""
+        hashed_user_key: Final = cls._hash_user_key(user_key) if user_key is not None else "unscoped"
+        return f"{cls.CACHE_KEY_PREFIX}:session:{model_group}:{hashed_user_key}:{session_id}"
 
     @staticmethod
     def _get_user_key_from_metadata_dict(metadata: dict) -> str | None:
@@ -279,6 +299,53 @@ class DeploymentAffinityCheck(CustomLogger):
         return None
 
     @staticmethod
+    def _get_marker_session_affinity_ttl(request_kwargs: dict) -> int | None:
+        """TTL from the session-affinity marker the Router stamps at pre-routing time
+        when an auto-router routed this request with session_affinity enabled.
+        Marker presence enables session pinning for this request only; anything that
+        is not a positive int is treated as absent."""
+        for metadata in DeploymentAffinityCheck._iter_metadata_dicts(request_kwargs):
+            ttl = metadata.get(SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY)
+            if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0:
+                return ttl
+        return None
+
+    async def _claim_pin(self, cache_key: str, pin_value: DeploymentAffinityCacheValue, ttl_seconds: int) -> object:
+        """First-writer-wins pin write: store `pin_value` only when the key is absent and
+        return whatever the key holds afterwards, so concurrent claimers converge on the
+        first write instead of the last. Re-claiming with the stored value refreshes its
+        TTL, the same keepalive the complexity router's model pin documents: an active
+        session must not lose its pin mid-conversation just because it outlives the
+        original write, so `session_affinity_ttl_seconds` bounds idle time, not total
+        session length. On Redis one Lua script does the get-or-set-or-refresh
+        atomically (same registration seam the rate limiters use) and the in-memory
+        tier is synchronized to the winner; without Redis the check-and-set below is
+        atomic because it runs synchronously on the event loop. The redis tier is
+        resolved per call because the proxy attaches it after Router construction
+        (`Router._update_redis_cache`); the compiled script is cached per event loop
+        underneath the registration seam.
+        """
+        redis_cache: Final = self.cache.redis_cache
+        if redis_cache is not None:
+            claim_script: Final = redis_cache.async_register_script(_CLAIM_PIN_SCRIPT)
+            raw: Final = await claim_script(keys=(cache_key,), args=(json.dumps(pin_value), int(ttl_seconds)))
+            decoded: Final = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            if not isinstance(decoded, str):
+                return pin_value
+            try:
+                winner: object = json.loads(decoded)
+            except json.JSONDecodeError:
+                winner = decoded
+            self.cache.in_memory_cache.set_cache(cache_key, winner, ttl=ttl_seconds)
+            return winner
+
+        existing: Final = self.cache.in_memory_cache.get_cache(cache_key)
+        if existing is not None:
+            return existing
+        self.cache.in_memory_cache.set_cache(cache_key, pin_value, ttl=ttl_seconds)
+        return pin_value
+
+    @staticmethod
     def _find_deployment_by_model_id(healthy_deployments: list[dict], model_id: str) -> dict | None:
         for deployment in healthy_deployments:
             model_info = deployment.get("model_info")
@@ -334,12 +401,21 @@ class DeploymentAffinityCheck(CustomLogger):
         if stable_model_map_key is None:
             return typed_healthy_deployments
 
+        session_affinity_active: Final = (
+            enable_session_id or self._get_marker_session_affinity_ttl(request_kwargs=request_kwargs) is not None
+        )
+        user_key: Final = (
+            self._get_user_key_from_request_kwargs(request_kwargs=request_kwargs)
+            if (session_affinity_active or enable_user_key)
+            else None
+        )
+
         # 2) Session-id -> deployment affinity
-        if enable_session_id:
+        if session_affinity_active:
             session_id: Final = self._get_session_id_from_request_kwargs(request_kwargs=request_kwargs)
             if session_id is not None:
                 session_cache_key: Final = self.get_session_affinity_cache_key(
-                    model_group=stable_model_map_key, session_id=session_id
+                    model_group=stable_model_map_key, session_id=session_id, user_key=user_key
                 )
                 session_cache_result: Final = await self.cache.async_get_cache(key=session_cache_key)
 
@@ -371,7 +447,6 @@ class DeploymentAffinityCheck(CustomLogger):
         if not enable_user_key:
             return typed_healthy_deployments
 
-        user_key: Final = self._get_user_key_from_request_kwargs(request_kwargs=request_kwargs)
         if user_key is None:
             return typed_healthy_deployments
 
@@ -438,18 +513,22 @@ class DeploymentAffinityCheck(CustomLogger):
             enable_session_id,
         ) = self._get_effective_flags(deployment_model_name)
 
-        if not enable_user_key and not enable_session_id:
+        marker_session_ttl: Final = self._get_marker_session_affinity_ttl(request_kwargs=kwargs)
+        session_affinity_active: Final = enable_session_id or marker_session_ttl is not None
+
+        if not enable_user_key and not session_affinity_active:
             return None
 
-        user_key = None
-        if enable_user_key:
-            user_key = self._get_user_key_from_request_kwargs(request_kwargs=kwargs)
+        user_key: Final = (
+            self._get_user_key_from_request_kwargs(request_kwargs=kwargs)
+            if (enable_user_key or session_affinity_active)
+            else None
+        )
+        session_id: Final = (
+            self._get_session_id_from_request_kwargs(request_kwargs=kwargs) if session_affinity_active else None
+        )
 
-        session_id = None
-        if enable_session_id:
-            session_id = self._get_session_id_from_request_kwargs(request_kwargs=kwargs)
-
-        if user_key is None and session_id is None:
+        if not ((enable_user_key and user_key is not None) or session_id is not None):
             return None
 
         model_info = kwargs.get("model_info")
@@ -473,22 +552,31 @@ class DeploymentAffinityCheck(CustomLogger):
             verbose_router_logger.warning("DeploymentAffinityCheck: model_id missing; skipping affinity cache update.")
             return None
 
-        if user_key is not None:
+        pin_value: Final = DeploymentAffinityCacheValue(model_id=str(model_id))
+
+        if enable_user_key and user_key is not None:
             try:
                 cache_key: Final = self.get_affinity_cache_key(model_group=deployment_model_name, user_key=user_key)
-                await self.cache.async_set_cache(
-                    cache_key,
-                    DeploymentAffinityCacheValue(model_id=str(model_id)),
-                    ttl=self.ttl_seconds,
+                claimed_user_pin: Final = await self._claim_pin(
+                    cache_key=cache_key,
+                    pin_value=pin_value,
+                    ttl_seconds=self.ttl_seconds,
                 )
-
-                verbose_router_logger.debug(
-                    "DeploymentAffinityCheck: set affinity mapping model_map_key=%s deployment=%s ttl=%s user_key=%s",
-                    deployment_model_name,
-                    model_id,
-                    self.ttl_seconds,
-                    self._shorten_for_logs(user_key),
-                )
+                if claimed_user_pin == pin_value:
+                    verbose_router_logger.debug(
+                        "DeploymentAffinityCheck: set affinity mapping model_map_key=%s deployment=%s ttl=%s user_key=%s",
+                        deployment_model_name,
+                        model_id,
+                        self.ttl_seconds,
+                        self._shorten_for_logs(user_key),
+                    )
+                else:
+                    verbose_router_logger.debug(
+                        "DeploymentAffinityCheck: affinity pin already claimed model_map_key=%s existing=%s ours=%s",
+                        deployment_model_name,
+                        claimed_user_pin,
+                        model_id,
+                    )
             except Exception as e:
                 # Non-blocking: affinity is a best-effort optimization.
                 verbose_router_logger.debug(
@@ -500,21 +588,31 @@ class DeploymentAffinityCheck(CustomLogger):
         # Also persist Session-ID affinity if enabled and session-id is provided
         if session_id is not None:
             try:
+                session_affinity_ttl: Final = marker_session_ttl if marker_session_ttl is not None else self.ttl_seconds
                 session_cache_key: Final = self.get_session_affinity_cache_key(
-                    model_group=deployment_model_name, session_id=session_id
+                    model_group=deployment_model_name, session_id=session_id, user_key=user_key
                 )
-                await self.cache.async_set_cache(
-                    session_cache_key,
-                    DeploymentAffinityCacheValue(model_id=str(model_id)),
-                    ttl=self.ttl_seconds,
+                claimed_session_pin: Final = await self._claim_pin(
+                    cache_key=session_cache_key,
+                    pin_value=pin_value,
+                    ttl_seconds=session_affinity_ttl,
                 )
-                verbose_router_logger.debug(
-                    "DeploymentAffinityCheck: set session affinity mapping model_map_key=%s deployment=%s ttl=%s session_id=%s",
-                    deployment_model_name,
-                    model_id,
-                    self.ttl_seconds,
-                    session_id,
-                )
+                if claimed_session_pin == pin_value:
+                    verbose_router_logger.debug(
+                        "DeploymentAffinityCheck: set session affinity mapping model_map_key=%s deployment=%s ttl=%s session_id=%s",
+                        deployment_model_name,
+                        model_id,
+                        session_affinity_ttl,
+                        session_id,
+                    )
+                else:
+                    verbose_router_logger.debug(
+                        "DeploymentAffinityCheck: session pin already claimed model_map_key=%s existing=%s ours=%s session_id=%s",
+                        deployment_model_name,
+                        claimed_session_pin,
+                        model_id,
+                        session_id,
+                    )
             except Exception as e:
                 verbose_router_logger.debug(
                     "DeploymentAffinityCheck: failed to set session affinity cache. model_map_key=%s error=%s",
