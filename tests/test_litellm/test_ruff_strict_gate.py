@@ -1,15 +1,21 @@
 import importlib.util
+import shutil
 import subprocess
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 
-_MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ruff_strict_gate.py"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_MODULE_PATH = _REPO_ROOT / "scripts" / "ruff_strict_gate.py"
 _spec = importlib.util.spec_from_file_location("ruff_strict_gate", _MODULE_PATH)
 gate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gate)
 
 Violation = gate.Violation
+
+_ENABLED_BY_THE_NORMAL_CONFIG = frozenset({"F401", "RUF100"})
 
 
 def rule(name, limit):
@@ -151,3 +157,67 @@ def test_base_point_mid_merge_advances_to_the_merged_in_base_tip(tmp_path):
     repo, _, base_tip = _branched_repo(tmp_path)
     _git(repo, "merge", "--no-commit", "--no-ff", "main")
     assert gate.resolve_base_point("main", cwd=repo) == base_tip
+
+
+def _lint_section(config_name: str) -> dict:
+    return tomllib.loads((_REPO_ROOT / config_name).read_text())["lint"]
+
+
+def _external_codes() -> frozenset:
+    return frozenset(_lint_section("ruff.toml")["external"])
+
+
+def _ruff_binary() -> str | None:
+    beside_interpreter = Path(sys.executable).with_name("ruff")
+    return str(beside_interpreter) if beside_interpreter.exists() else shutil.which("ruff")
+
+
+_RUFF = _ruff_binary()
+_needs_ruff = pytest.mark.skipif(_RUFF is None, reason="ruff is not installed in this environment")
+
+
+def _ruff_output_for_noqa(code: str, *extra_args: str) -> str:
+    proc = subprocess.run(
+        [
+            _RUFF,
+            "check",
+            "--no-cache",
+            "--stdin-filename",
+            "litellm/types/_external_probe.py",
+            *extra_args,
+            "-",
+        ],
+        cwd=_REPO_ROOT,
+        input=f"def _probe(x: int):  # noqa: {code}\n    return x\n",
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout
+
+
+def test_every_strict_gate_rule_is_external_to_the_normal_ruff_config():
+    strict_rules = frozenset(_lint_section("ruff-strict.toml")["select"])
+    unprotected = strict_rules - _external_codes() - _ENABLED_BY_THE_NORMAL_CONFIG
+    assert unprotected == frozenset(), (
+        f"`ruff check` deletes any `# noqa` naming {sorted(unprotected)} as unused, so suppressing "
+        "one of those strict-gate rules breaks lint. Add them to ruff.toml's lint.external."
+    )
+
+
+def test_the_codes_this_config_enforces_itself_stay_out_of_external():
+    assert _ENABLED_BY_THE_NORMAL_CONFIG.isdisjoint(_external_codes())
+
+
+@_needs_ruff
+def test_a_noqa_for_a_strict_gate_rule_survives_the_normal_ruff_run():
+    assert "RUF100" not in _ruff_output_for_noqa("ANN202")
+
+
+@_needs_ruff
+def test_the_external_list_is_what_saves_that_noqa():
+    assert "RUF100" in _ruff_output_for_noqa("ANN202", "--config", "lint.external=[]")
+
+
+@_needs_ruff
+def test_a_stale_noqa_for_a_locally_enabled_rule_is_still_reported():
+    assert "RUF100" in _ruff_output_for_noqa("F401")
