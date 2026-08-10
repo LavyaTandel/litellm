@@ -1730,6 +1730,7 @@ class ProxyBaseLLMRequestProcessing:
         is_streaming_request: bool | None = False,
         contents: list | None = None,  # Add contents parameter
         skip_pre_call_logic: bool = False,
+        cancel_on_disconnect: bool | None = None,
     ) -> Any:
         """
         Common request processing logic for both chat completions and responses API endpoints
@@ -1815,8 +1816,16 @@ class ProxyBaseLLMRequestProcessing:
 
         llm_responses: Final = asyncio.gather(*tasks)  # run the moderation check in parallel to the actual llm api call
 
+        # cancel_on_disconnect: explicit override (e.g. background polling tasks
+        # where the client intentionally disconnects). Falls back to general_settings.
+        _cancel_on_disconnect = (
+            cancel_on_disconnect
+            if cancel_on_disconnect is not None
+            else general_settings.get("cancel_on_disconnect", False)
+        )
+
         try:
-            if general_settings.get("cancel_on_disconnect", False):
+            if _cancel_on_disconnect:
                 responses = await _await_llm_call_cancelling_on_disconnect(request, llm_responses)
             else:
                 responses = await llm_responses
